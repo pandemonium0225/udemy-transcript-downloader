@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.zip
+*.crx
+*.pem
+
+# Generated files (可選擇保留圖示)
+# icons/*.png
+
+# Logs
+*.log

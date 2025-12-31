@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Udemy Transcript Downloader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Udemy 逐字稿下載器</h1>
+
+    <div id="not-udemy" class="message error" style="display: none;">
+      請在 Udemy 課程頁面使用此擴充功能
+    </div>
+
+    <div id="not-logged-in" class="message warning" style="display: none;">
+      <strong>尚未登入</strong>
+      <p>請先登入您的 Udemy 帳號</p>
+      <a href="https://www.udemy.com/join/login-popup/" target="_blank" class="btn-link">前往登入</a>
+    </div>
+
+    <div id="no-access" class="message warning" style="display: none;">
+      <strong>無法存取課程</strong>
+      <p id="no-access-reason">您可能尚未購買此課程</p>
+    </div>
+
+    <div id="main-content">
+      <div class="course-info">
+        <h2 id="course-title">載入中...</h2>
+        <p id="course-stats"></p>
+      </div>
+
+      <div class="options">
+        <label>
+          <input type="checkbox" id="include-timestamps" checked>
+          包含時間戳記
+        </label>
+      </div>
+
+      <div class="chapters-section">
+        <div class="chapters-header">
+          <h3>選擇章節</h3>
+          <div class="select-buttons">
+            <button id="select-all" class="btn-small">全選</button>
+            <button id="select-none" class="btn-small">取消全選</button>
+          </div>
+        </div>
+        <div id="chapters-list" class="chapters-list">
+          <p class="loading">正在載入章節...</p>
+        </div>
+      </div>
+
+      <div class="progress-section" style="display: none;">
+        <div class="progress-bar">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+        <p id="progress-text">準備中...</p>
+      </div>
+
+      <div class="actions">
+        <button id="download-btn" class="btn-primary" disabled>
+          下載選取的章節
+        </button>
+        <button id="download-all-btn" class="btn-secondary" disabled>
+          下載全部 (合併檔案)
+        </button>
+      </div>
+
+      <div id="status" class="status"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

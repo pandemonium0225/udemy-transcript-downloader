@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Generate Icons</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    canvas { border: 1px solid #ccc; margin: 10px; }
+    .icon-container { display: inline-block; text-align: center; margin: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Udemy Transcript Downloader Icons</h1>
+  <p>Right-click each icon and save as PNG file with the specified name.</p>
+
+  <div class="icon-container">
+    <canvas id="icon16" width="16" height="16"></canvas>
+    <p>icon16.png</p>
+  </div>
+  <div class="icon-container">
+    <canvas id="icon48" width="48" height="48"></canvas>
+    <p>icon48.png</p>
+  </div>
+  <div class="icon-container">
+    <canvas id="icon128" width="128" height="128"></canvas>
+    <p>icon128.png</p>
+  </div>
+
+  <script>
+    function drawIcon(canvasId, size) {
+      const canvas = document.getElementById(canvasId);
+      const ctx = canvas.getContext('2d');
+
+      // Background - Udemy purple
+      ctx.fillStyle = '#a435f0';
+      ctx.beginPath();
+      ctx.roundRect(0, 0, size, size, size * 0.15);
+      ctx.fill();
+
+      // Text "T" for Transcript
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold ${size * 0.6}px Arial`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('T', size / 2, size / 2 + size * 0.05);
+
+      // Download arrow
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = size * 0.08;
+      ctx.lineCap = 'round';
+
+      const arrowX = size * 0.75;
+      const arrowY = size * 0.7;
+      const arrowSize = size * 0.15;
+
+      ctx.beginPath();
+      ctx.moveTo(arrowX, arrowY - arrowSize);
+      ctx.lineTo(arrowX, arrowY);
+      ctx.lineTo(arrowX - arrowSize * 0.6, arrowY - arrowSize * 0.5);
+      ctx.moveTo(arrowX, arrowY);
+      ctx.lineTo(arrowX + arrowSize * 0.6, arrowY - arrowSize * 0.5);
+      ctx.stroke();
+    }
+
+    drawIcon('icon16', 16);
+    drawIcon('icon48', 48);
+    drawIcon('icon128', 128);
+  </script>
+</body>
+</html>
