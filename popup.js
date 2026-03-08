@@ -1,7 +1,10 @@
-// Udemy Transcript Downloader - Popup Script
-// 使用 Udemy API 批次下載字幕
+// Udemy Transcript Downloader - Popup Script (v2.0)
+// 純 UI 控制器：顯示資訊、發送指令給 background.js
 
 document.addEventListener('DOMContentLoaded', async () => {
+  // ============================================================
+  // DOM 元素
+  // ============================================================
   const courseTitle = document.getElementById('course-title');
   const courseStats = document.getElementById('course-stats');
   const chaptersList = document.getElementById('chapters-list');
@@ -10,6 +13,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const selectAllBtn = document.getElementById('select-all');
   const selectNoneBtn = document.getElementById('select-none');
   const includeTimestamps = document.getElementById('include-timestamps');
+  const localeSelect = document.getElementById('locale-select');
   const progressSection = document.querySelector('.progress-section');
   const progressFill = document.getElementById('progress-fill');
   const progressText = document.getElementById('progress-text');
@@ -19,68 +23,89 @@ document.addEventListener('DOMContentLoaded', async () => {
   const noAccess = document.getElementById('no-access');
   const noAccessReason = document.getElementById('no-access-reason');
   const mainContent = document.getElementById('main-content');
+  const pauseBtn = document.getElementById('pause-btn');
+  const cancelBtn = document.getElementById('cancel-btn');
+  const downloadControls = document.getElementById('download-controls');
+  const runningControls = document.getElementById('running-controls');
 
   let courseData = null;
   let currentTab = null;
 
-  // 獲取當前分頁
+  // ============================================================
+  // 工具函數
+  // ============================================================
   async function getCurrentTab() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     return tab;
   }
 
-  // 檢查是否在 Udemy 課程頁面
   function isUdemyCoursePage(url) {
     return url && url.includes('udemy.com/course/');
   }
 
-  // 發送消息到 content script
-  async function sendMessage(action, data = {}) {
-    // 先嘗試注入 content script (如果還沒注入的話)
+  async function sendToContentScript(action, data = {}) {
+    // 嘗試注入 content script
     try {
       await chrome.scripting.executeScript({
         target: { tabId: currentTab.id },
         files: ['content.js']
       });
-      await sleep(500);
+      await sleep(300);
     } catch (e) {
-      // 可能已經注入過了，忽略錯誤
-      console.log('Script may already be injected:', e.message);
+      // 可能已注入
     }
 
-    // 發送消息
     try {
-      const response = await chrome.tabs.sendMessage(currentTab.id, { action, ...data });
-      return response;
+      return await chrome.tabs.sendMessage(currentTab.id, { action, ...data });
     } catch (error) {
-      console.error('Failed to send message:', error);
       throw new Error('無法連接到頁面，請重新整理 Udemy 頁面後再試');
     }
   }
 
-  // 顯示狀態訊息
+  async function sendToBackground(action, data = {}) {
+    return chrome.runtime.sendMessage({ action, ...data });
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function sanitizeFilename(name) {
+    return name.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, ' ').trim().substring(0, 100);
+  }
+
+  // ============================================================
+  // UI 更新
+  // ============================================================
   function showStatus(message, type = 'info') {
     statusDiv.textContent = message;
     statusDiv.className = `status ${type}`;
   }
 
-  // 更新進度
-  function updateProgress(current, total, text) {
-    const percent = Math.round((current / total) * 100);
+  function updateProgress(progress) {
+    const { processedLectures, totalLectures, currentLectureName } = progress;
+    const percent = totalLectures > 0 ? Math.round((processedLectures / totalLectures) * 100) : 0;
     progressFill.style.width = `${percent}%`;
-    progressText.textContent = text || `處理中... ${current}/${total} (${percent}%)`;
+    const displayName = currentLectureName
+      ? currentLectureName.substring(0, 40) + (currentLectureName.length > 40 ? '...' : '')
+      : '';
+    progressText.textContent = `${processedLectures}/${totalLectures} (${percent}%) ${displayName}`;
   }
 
-  // 清理檔名
-  function sanitizeFilename(name) {
-    return name
-      .replace(/[<>:"/\\|?*]/g, '_')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .substring(0, 100);
+  function showDownloadUI() {
+    downloadControls.style.display = 'flex';
+    runningControls.style.display = 'none';
+    progressSection.style.display = 'none';
   }
 
-  // 渲染章節列表
+  function showRunningUI(isPaused) {
+    downloadControls.style.display = 'none';
+    runningControls.style.display = 'flex';
+    progressSection.style.display = 'block';
+    pauseBtn.textContent = isPaused ? '繼續' : '暫停';
+    pauseBtn.className = isPaused ? 'btn-primary' : 'btn-secondary';
+  }
+
   function renderChapters(chapters) {
     if (!chapters || chapters.length === 0) {
       chaptersList.innerHTML = '<p class="loading">找不到章節，請確保課程內容已載入</p>';
@@ -101,198 +126,40 @@ document.addEventListener('DOMContentLoaded', async () => {
     downloadAllBtn.disabled = false;
   }
 
-  // 獲取選中的章節
   function getSelectedChapters() {
     const checkboxes = chaptersList.querySelectorAll('input[type="checkbox"]:checked');
     return Array.from(checkboxes).map(cb => parseInt(cb.dataset.index));
   }
 
-  // 下載單個文字檔
-  function downloadTextFile(content, filename) {
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-
-    chrome.downloads.download({
-      url: url,
-      filename: filename,
-      saveAs: false
-    });
-  }
-
-  // 批次下載選中的章節 (分開檔案)
-  async function downloadSelectedChapters() {
-    const selectedIndices = getSelectedChapters();
-
-    if (selectedIndices.length === 0) {
-      showStatus('請至少選擇一個章節', 'error');
+  function renderLocaleSelect(locales) {
+    if (!locales || locales.length === 0) {
+      localeSelect.innerHTML = '<option value="en">English (預設)</option>';
       return;
     }
 
-    const withTimestamps = includeTimestamps.checked;
-    const courseName = sanitizeFilename(courseData.title);
-    const courseId = courseData.courseId;
+    const localeNames = {
+      'en_US': 'English (US)',
+      'en_GB': 'English (UK)',
+      'zh_TW': '繁體中文',
+      'zh_CN': '簡體中文',
+      'ja_JP': '日本語',
+      'ko_KR': '한국어',
+      'es_ES': 'Español',
+      'fr_FR': 'Français',
+      'de_DE': 'Deutsch',
+      'pt_BR': 'Português (BR)',
+      'it_IT': 'Italiano',
+      'vi_VN': 'Tiếng Việt',
+      'th_TH': 'ไทย',
+      'id_ID': 'Bahasa Indonesia',
+    };
 
-    downloadBtn.disabled = true;
-    downloadAllBtn.disabled = true;
-    progressSection.style.display = 'block';
-
-    let totalLectures = 0;
-    selectedIndices.forEach(idx => {
-      totalLectures += courseData.chapters[idx].lectures.length;
-    });
-
-    let processedLectures = 0;
-    let successCount = 0;
-
-    try {
-      for (const chapterIndex of selectedIndices) {
-        const chapter = courseData.chapters[chapterIndex];
-        const chapterNum = String(chapterIndex + 1).padStart(2, '0');
-        const chapterName = sanitizeFilename(chapter.title);
-
-        let chapterContent = `${'='.repeat(60)}\n`;
-        chapterContent += `Chapter ${chapterNum}: ${chapter.title}\n`;
-        chapterContent += `${'='.repeat(60)}\n\n`;
-
-        for (let i = 0; i < chapter.lectures.length; i++) {
-          const lecture = chapter.lectures[i];
-          processedLectures++;
-
-          updateProgress(
-            processedLectures,
-            totalLectures,
-            `正在下載: ${lecture.title.substring(0, 40)}...`
-          );
-
-          // 使用 API 獲取字幕
-          const result = await sendMessage('getLectureTranscript', {
-            courseId: courseId,
-            lectureId: lecture.id,
-            includeTimestamps: withTimestamps
-          });
-
-          const lectureNum = String(i + 1).padStart(2, '0');
-          chapterContent += `${'-'.repeat(40)}\n`;
-          chapterContent += `Lecture ${lectureNum}: ${lecture.title}\n`;
-          chapterContent += `${'-'.repeat(40)}\n\n`;
-
-          if (result && result.success && result.data && result.data.transcript) {
-            chapterContent += result.data.transcript;
-            successCount++;
-          } else {
-            chapterContent += '[無字幕]';
-          }
-
-          chapterContent += '\n\n';
-
-          // 小延遲避免請求過快
-          await sleep(200);
-        }
-
-        // 下載這個章節的檔案
-        const filename = `${courseName}/${chapterNum}_${chapterName}.txt`;
-        downloadTextFile(chapterContent, filename);
-
-        await sleep(300);
-      }
-
-      showStatus(`成功下載 ${selectedIndices.length} 個章節！(${successCount}/${totalLectures} 個講座有字幕)`, 'success');
-    } catch (error) {
-      console.error('Download error:', error);
-      showStatus(`下載失敗: ${error.message}`, 'error');
-    } finally {
-      downloadBtn.disabled = false;
-      downloadAllBtn.disabled = false;
-      progressSection.style.display = 'none';
-    }
+    localeSelect.innerHTML = locales.map(loc => {
+      const name = localeNames[loc] || loc;
+      return `<option value="${loc}">${name}</option>`;
+    }).join('');
   }
 
-  // 下載全部為單一合併檔案
-  async function downloadAllMerged() {
-    const withTimestamps = includeTimestamps.checked;
-    const courseName = sanitizeFilename(courseData.title);
-    const courseId = courseData.courseId;
-
-    downloadBtn.disabled = true;
-    downloadAllBtn.disabled = true;
-    progressSection.style.display = 'block';
-
-    const totalLectures = courseData.chapters.reduce((sum, ch) => sum + ch.lectures.length, 0);
-    let processedLectures = 0;
-    let successCount = 0;
-
-    let fullContent = `${'#'.repeat(60)}\n`;
-    fullContent += `# ${courseData.title}\n`;
-    fullContent += `# Total Chapters: ${courseData.chapters.length}\n`;
-    fullContent += `# Total Lectures: ${totalLectures}\n`;
-    fullContent += `${'#'.repeat(60)}\n\n`;
-
-    try {
-      for (let chapterIndex = 0; chapterIndex < courseData.chapters.length; chapterIndex++) {
-        const chapter = courseData.chapters[chapterIndex];
-        const chapterNum = String(chapterIndex + 1).padStart(2, '0');
-
-        fullContent += `\n${'='.repeat(60)}\n`;
-        fullContent += `Chapter ${chapterNum}: ${chapter.title}\n`;
-        fullContent += `${'='.repeat(60)}\n\n`;
-
-        for (let i = 0; i < chapter.lectures.length; i++) {
-          const lecture = chapter.lectures[i];
-          processedLectures++;
-
-          updateProgress(
-            processedLectures,
-            totalLectures,
-            `正在下載: ${lecture.title.substring(0, 40)}...`
-          );
-
-          // 使用 API 獲取字幕
-          const result = await sendMessage('getLectureTranscript', {
-            courseId: courseId,
-            lectureId: lecture.id,
-            includeTimestamps: withTimestamps
-          });
-
-          const lectureNum = String(i + 1).padStart(2, '0');
-          fullContent += `${'-'.repeat(40)}\n`;
-          fullContent += `Lecture ${lectureNum}: ${lecture.title}\n`;
-          fullContent += `${'-'.repeat(40)}\n\n`;
-
-          if (result && result.success && result.data && result.data.transcript) {
-            fullContent += result.data.transcript;
-            successCount++;
-          } else {
-            fullContent += '[無字幕]';
-          }
-
-          fullContent += '\n\n';
-
-          // 小延遲避免請求過快
-          await sleep(200);
-        }
-      }
-
-      // 下載合併檔案
-      const filename = `${courseName}_complete_transcript.txt`;
-      downloadTextFile(fullContent, filename);
-
-      showStatus(`成功下載完整課程！(${successCount}/${totalLectures} 個講座有字幕)`, 'success');
-    } catch (error) {
-      console.error('Download error:', error);
-      showStatus(`下載失敗: ${error.message}`, 'error');
-    } finally {
-      downloadBtn.disabled = false;
-      downloadAllBtn.disabled = false;
-      progressSection.style.display = 'none';
-    }
-  }
-
-  // 睡眠函數
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  // 隱藏所有錯誤訊息
   function hideAllErrors() {
     notUdemy.style.display = 'none';
     notLoggedIn.style.display = 'none';
@@ -300,23 +167,77 @@ document.addEventListener('DOMContentLoaded', async () => {
     mainContent.style.display = 'block';
   }
 
-  // 顯示特定錯誤
   function showError(type, reason = '') {
     mainContent.style.display = 'none';
-
-    if (type === 'not_udemy') {
-      notUdemy.style.display = 'block';
-    } else if (type === 'not_logged_in') {
-      notLoggedIn.style.display = 'block';
-    } else if (type === 'no_access') {
+    if (type === 'not_udemy') notUdemy.style.display = 'block';
+    else if (type === 'not_logged_in') notLoggedIn.style.display = 'block';
+    else if (type === 'no_access') {
       noAccess.style.display = 'block';
-      if (reason) {
-        noAccessReason.textContent = reason;
-      }
+      if (reason) noAccessReason.textContent = reason;
     }
   }
 
+  // ============================================================
+  // 下載動作
+  // ============================================================
+  async function startDownload(mergeMode) {
+    const selectedIndices = mergeMode ? null : getSelectedChapters();
+
+    if (!mergeMode && selectedIndices.length === 0) {
+      showStatus('請至少選擇一個章節', 'error');
+      return;
+    }
+
+    const options = {
+      includeTimestamps: includeTimestamps.checked,
+      locale: localeSelect.value,
+      selectedIndices: mergeMode
+        ? courseData.chapters.map((_, i) => i)
+        : selectedIndices,
+      mergeMode,
+    };
+
+    showRunningUI(false);
+
+    try {
+      await sendToBackground('startDownload', {
+        tabId: currentTab.id,
+        courseData,
+        options,
+      });
+    } catch (error) {
+      showStatus(`啟動下載失敗: ${error.message}`, 'error');
+      showDownloadUI();
+    }
+  }
+
+  // ============================================================
+  // 監聽 background 進度廣播
+  // ============================================================
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message.type === 'progressUpdate') {
+      const { isRunning, isPaused, progress, error } = message.state;
+
+      if (isRunning) {
+        showRunningUI(isPaused);
+        updateProgress(progress);
+      } else {
+        showDownloadUI();
+        if (error) {
+          showStatus(`下載失敗: ${error}`, 'error');
+        } else if (progress.processedLectures > 0) {
+          showStatus(
+            `下載完成！(${progress.successCount}/${progress.totalLectures} 個講座有字幕)`,
+            'success'
+          );
+        }
+      }
+    }
+  });
+
+  // ============================================================
   // 初始化
+  // ============================================================
   async function init() {
     try {
       currentTab = await getCurrentTab();
@@ -326,25 +247,51 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
 
+      // 先檢查是否有正在執行的下載
+      const bgState = await sendToBackground('getDownloadState');
+      if (bgState && bgState.isRunning) {
+        showRunningUI(bgState.isPaused);
+        updateProgress(bgState.progress);
+        return;
+      }
+
       chaptersList.innerHTML = '<p class="loading">正在載入課程結構...</p>';
 
-      // 獲取課程信息
-      const result = await sendMessage('getCourseInfo');
+      // 從 content script 取得課程基本資訊
+      const result = await sendToContentScript('getCourseInfo');
 
       if (result && result.success) {
         hideAllErrors();
-        courseData = result.data;
-        courseTitle.textContent = courseData.title;
-        courseStats.textContent = `${courseData.totalChapters} 個章節 · ${courseData.totalLectures} 個講座`;
-        renderChapters(courseData.chapters);
-      } else if (result && !result.success) {
-        if (result.errorType === 'not_logged_in') {
-          showError('not_logged_in');
-        } else if (result.errorType === 'no_access') {
-          showError('no_access', result.error);
+
+        const { courseId, title, availableLocales } = result.data;
+
+        // 用 background 的 API 代理取得完整課程結構
+        const structResult = await sendToBackground('fetchCourseInfo', {
+          tabId: currentTab.id,
+          courseId,
+        });
+
+        if (structResult && structResult.success) {
+          courseData = {
+            courseId,
+            title,
+            chapters: structResult.data.chapters,
+            totalChapters: structResult.data.totalChapters,
+            totalLectures: structResult.data.totalLectures,
+          };
+
+          courseTitle.textContent = title;
+          courseStats.textContent = `${courseData.totalChapters} 個章節 · ${courseData.totalLectures} 個講座`;
+          renderChapters(courseData.chapters);
+          renderLocaleSelect(availableLocales);
         } else {
-          chaptersList.innerHTML = `<p class="loading">${result.error || '無法載入課程資訊，請重新整理頁面後再試'}</p>`;
+          chaptersList.innerHTML = `<p class="loading">${structResult?.error || '無法載入課程結構'}</p>`;
         }
+
+      } else if (result && !result.success) {
+        if (result.errorType === 'not_logged_in') showError('not_logged_in');
+        else if (result.errorType === 'no_access') showError('no_access', result.error);
+        else chaptersList.innerHTML = `<p class="loading">${result.error || '無法載入課程資訊'}</p>`;
       } else {
         chaptersList.innerHTML = '<p class="loading">無法載入課程資訊，請重新整理頁面後再試</p>';
       }
@@ -354,7 +301,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // 事件監聽
+  // ============================================================
+  // 事件綁定
+  // ============================================================
   selectAllBtn.addEventListener('click', () => {
     chaptersList.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = true);
   });
@@ -363,8 +312,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     chaptersList.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
   });
 
-  downloadBtn.addEventListener('click', downloadSelectedChapters);
-  downloadAllBtn.addEventListener('click', downloadAllMerged);
+  downloadBtn.addEventListener('click', () => startDownload(false));
+  downloadAllBtn.addEventListener('click', () => startDownload(true));
+
+  pauseBtn.addEventListener('click', async () => {
+    const state = await sendToBackground('getDownloadState');
+    if (state.isPaused) {
+      await sendToBackground('resumeDownload');
+      pauseBtn.textContent = '暫停';
+      pauseBtn.className = 'btn-secondary';
+    } else {
+      await sendToBackground('pauseDownload');
+      pauseBtn.textContent = '繼續';
+      pauseBtn.className = 'btn-primary';
+    }
+  });
+
+  cancelBtn.addEventListener('click', async () => {
+    await sendToBackground('cancelDownload');
+    showDownloadUI();
+    showStatus('已取消下載', 'info');
+  });
 
   // 啟動
   init();

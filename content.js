@@ -1,248 +1,154 @@
-// Udemy Transcript Downloader - Content Script
-// 使用 Udemy API 獲取課程結構和字幕
+// Udemy Transcript Downloader - Content Script (v2.0)
+// 精簡版：只負責取得課程 ID 與基本資訊，下載邏輯在 background.js
 
 (function() {
   'use strict';
 
-  // 從頁面獲取課程 ID
+  // ============================================================
+  // 多策略取得課程 ID
+  // ============================================================
   function getCourseId() {
+    // 策略 1: 從 React data-module-args 取得
     const reactRoot = document.querySelector('[data-module-id="course-taking"]');
     if (reactRoot) {
       try {
         const moduleArgs = JSON.parse(reactRoot.dataset.moduleArgs || '{}');
-        return moduleArgs.courseId;
+        if (moduleArgs.courseId) return moduleArgs.courseId;
       } catch(e) {
-        console.error('Failed to parse module args:', e);
+        console.warn('Strategy 1 failed:', e.message);
       }
+    }
+
+    // 策略 2: 從頁面中的 JSON-LD 結構化資料取得
+    const jsonLdScripts = document.querySelectorAll('script[type="application/ld+json"]');
+    for (const script of jsonLdScripts) {
+      try {
+        const data = JSON.parse(script.textContent);
+        if (data['@type'] === 'Course' && data.url) {
+          const match = data.url.match(/\/course\/([^/]+)/);
+          if (match) return match[1]; // slug, not numeric ID
+        }
+      } catch(e) { /* skip */ }
+    }
+
+    // 策略 3: 從 window 全域變數取得
+    try {
+      const udData = window.__UDEMY_DATA__;
+      if (udData && udData.course && udData.course.id) {
+        return udData.course.id;
+      }
+    } catch(e) { /* skip */ }
+
+    // 策略 4: 從 body 上的 data 屬性取得
+    const bodyDataCourse = document.body?.dataset?.courseId;
+    if (bodyDataCourse) return bodyDataCourse;
+
+    // 策略 5: 從 URL 解析 course slug，再用 API 取得數字 ID
+    // (此策略需要額外的 API 呼叫，在 getCourseInfo handler 中處理)
+    const urlMatch = window.location.pathname.match(/\/course\/([^/]+)/);
+    if (urlMatch) {
+      return { type: 'slug', slug: urlMatch[1] };
+    }
+
+    return null;
+  }
+
+  // 從 slug 解析出數字 ID
+  async function resolveSlugToId(slug) {
+    try {
+      const response = await fetch(
+        `https://www.udemy.com/api-2.0/courses/${slug}/?fields[course]=id,title`,
+        { credentials: 'include' }
+      );
+      if (response.ok) {
+        const data = await response.json();
+        return data.id;
+      }
+    } catch(e) {
+      console.error('Failed to resolve slug:', e);
     }
     return null;
   }
 
   // 獲取課程標題
   function getCourseTitle() {
+    // 嘗試多個來源
+    const ogTitle = document.querySelector('meta[property="og:title"]');
+    if (ogTitle) return ogTitle.content.trim();
+
     const titleEl = document.querySelector('title');
-    if (titleEl) {
-      return titleEl.textContent.replace(' | Udemy', '').trim();
-    }
+    if (titleEl) return titleEl.textContent.replace(' | Udemy', '').trim();
+
     return 'Udemy Course';
   }
 
-  // 使用 API 獲取課程結構
-  async function fetchCourseStructure(courseId) {
-    const allItems = [];
-    let nextUrl = `https://www.udemy.com/api-2.0/courses/${courseId}/subscriber-curriculum-items/?page_size=100&fields[lecture]=title,asset&fields[chapter]=title&fields[asset]=captions`;
-
-    while (nextUrl) {
-      try {
-        const response = await fetch(nextUrl, { credentials: 'include' });
-        if (!response.ok) {
-          console.error('API error:', response.status);
-          break;
-        }
-        const data = await response.json();
-        allItems.push(...data.results);
-        nextUrl = data.next;
-      } catch (error) {
-        console.error('Fetch error:', error);
-        break;
-      }
-    }
-
-    // 組織成章節和講座結構
-    const chapters = [];
-    let currentChapter = null;
-
-    allItems.forEach(item => {
-      if (item._class === 'chapter') {
-        currentChapter = {
-          id: item.id,
-          title: item.title,
-          lectures: []
-        };
-        chapters.push(currentChapter);
-      } else if (item._class === 'lecture' && currentChapter) {
-        currentChapter.lectures.push({
-          id: item.id,
-          title: item.title,
-          hasCaptions: item.asset && item.asset.captions && item.asset.captions.length > 0
-        });
-      }
-    });
-
-    return chapters;
-  }
-
-  // 獲取單個講座的字幕
-  async function fetchLectureCaption(courseId, lectureId, locale = 'en') {
+  // 取得可用的字幕語言列表
+  async function getAvailableLocales(courseId) {
     try {
       const response = await fetch(
-        `https://www.udemy.com/api-2.0/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset,title&fields[asset]=captions`,
+        `https://www.udemy.com/api-2.0/courses/${courseId}/subscriber-curriculum-items/?page_size=1&fields[lecture]=asset&fields[asset]=captions`,
+        { credentials: 'include' }
+      );
+      if (!response.ok) return [];
+
+      const data = await response.json();
+      const locales = new Set();
+
+      for (const item of data.results) {
+        if (item._class === 'lecture' && item.asset && item.asset.captions) {
+          for (const cap of item.asset.captions) {
+            if (cap.locale_id) locales.add(cap.locale_id);
+          }
+        }
+      }
+
+      return Array.from(locales);
+    } catch(e) {
+      return [];
+    }
+  }
+
+  // 檢查登入狀態 (改用 API 回應判斷)
+  async function checkLoginViaAPI(courseId) {
+    try {
+      const response = await fetch(
+        `https://www.udemy.com/api-2.0/users/me/subscribed-courses/${courseId}/?fields[course]=id`,
         { credentials: 'include' }
       );
 
-      if (!response.ok) {
-        console.error('Lecture API error:', response.status);
-        return null;
-      }
+      if (response.ok) return { isLoggedIn: true, hasAccess: true };
+      if (response.status === 401) return { isLoggedIn: false, reason: '請先登入 Udemy 帳號' };
+      if (response.status === 403) return { isLoggedIn: true, hasAccess: false, reason: '您可能尚未購買此課程' };
 
-      const data = await response.json();
-
-      if (!data.asset || !data.asset.captions || data.asset.captions.length === 0) {
-        return { title: data.title, transcript: null };
-      }
-
-      // 找到合適的字幕 (優先英文)
-      const captions = data.asset.captions;
-      let caption = captions.find(c => c.locale_id && c.locale_id.startsWith(locale));
-      if (!caption) {
-        caption = captions.find(c => c.locale_id && c.locale_id.startsWith('en'));
-      }
-      if (!caption) {
-        caption = captions[0];
-      }
-
-      if (!caption || !caption.url) {
-        return { title: data.title, transcript: null };
-      }
-
-      // 下載 VTT 內容
-      const vttResponse = await fetch(caption.url);
-      const vttContent = await vttResponse.text();
-
-      // 解析 VTT 為文字
-      const transcript = parseVTT(vttContent);
-
-      return {
-        title: data.title,
-        transcript: transcript,
-        locale: caption.locale_id
-      };
-    } catch (error) {
-      console.error('Error fetching caption:', error);
-      return null;
+      return { isLoggedIn: null, reason: `API 回傳狀態碼: ${response.status}` };
+    } catch(e) {
+      return { isLoggedIn: null, reason: `連線失敗: ${e.message}` };
     }
   }
 
-  // 解析 VTT 格式為純文字
-  function parseVTT(vttContent, includeTimestamps = true) {
-    const lines = vttContent.split('\n');
-    const result = [];
-    let currentTime = '';
-    let currentText = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-
-      // 跳過 WEBVTT 標頭和空行
-      if (line === 'WEBVTT' || line === '' || line.startsWith('NOTE')) {
-        if (currentText.length > 0) {
-          if (includeTimestamps && currentTime) {
-            result.push(`[${currentTime}] ${currentText.join(' ')}`);
-          } else {
-            result.push(currentText.join(' '));
-          }
-          currentText = [];
-        }
-        continue;
-      }
-
-      // 檢查是否為時間軸行 (格式: 00:00.000 --> 00:00.000)
-      if (line.includes('-->')) {
-        if (currentText.length > 0) {
-          if (includeTimestamps && currentTime) {
-            result.push(`[${currentTime}] ${currentText.join(' ')}`);
-          } else {
-            result.push(currentText.join(' '));
-          }
-          currentText = [];
-        }
-        // 提取開始時間
-        const timeMatch = line.match(/^(\d{2}:\d{2})/);
-        if (timeMatch) {
-          currentTime = timeMatch[1];
-        }
-        continue;
-      }
-
-      // 跳過純數字行 (cue 標識符)
-      if (/^\d+$/.test(line)) {
-        continue;
-      }
-
-      // 這是字幕文字
-      if (line.length > 0) {
-        // 移除 HTML 標籤
-        const cleanText = line.replace(/<[^>]*>/g, '');
-        if (cleanText) {
-          currentText.push(cleanText);
-        }
-      }
-    }
-
-    // 處理最後一段
-    if (currentText.length > 0) {
-      if (includeTimestamps && currentTime) {
-        result.push(`[${currentTime}] ${currentText.join(' ')}`);
-      } else {
-        result.push(currentText.join(' '));
-      }
-    }
-
-    return result.join('\n');
-  }
-
-  // 檢查登入狀態
-  function checkLoginStatus() {
-    const userMenuSelectors = [
-      '[data-purpose="user-dropdown"]',
-      '.ud-avatar',
-      '[class*="user-profile"]'
-    ];
-
-    for (const selector of userMenuSelectors) {
-      if (document.querySelector(selector)) {
-        return { isLoggedIn: true };
-      }
-    }
-
-    const loginButtonSelectors = [
-      '[data-purpose="header-login"]',
-      'a[href*="/join/login"]'
-    ];
-
-    for (const selector of loginButtonSelectors) {
-      if (document.querySelector(selector)) {
-        return { isLoggedIn: false, reason: '請先登入 Udemy 帳號' };
-      }
-    }
-
-    // 檢查是否有課程內容 (表示已登入)
-    if (document.querySelector('[data-purpose="curriculum-section-container"]')) {
-      return { isLoggedIn: true };
-    }
-
-    return { isLoggedIn: null, reason: '無法確認登入狀態' };
-  }
-
-  // 監聽來自 popup 的消息
+  // ============================================================
+  // 訊息處理
+  // ============================================================
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    console.log('Content script received:', request.action);
-
     if (request.action === 'getCourseInfo') {
       (async () => {
         try {
-          const loginStatus = checkLoginStatus();
-          if (loginStatus.isLoggedIn === false) {
-            sendResponse({
-              success: false,
-              error: loginStatus.reason,
-              errorType: 'not_logged_in'
-            });
-            return;
-          }
+          let courseId = getCourseId();
 
-          const courseId = getCourseId();
-          console.log('Course ID:', courseId);
+          // 如果拿到的是 slug，需要解析成數字 ID
+          if (courseId && typeof courseId === 'object' && courseId.type === 'slug') {
+            const numericId = await resolveSlugToId(courseId.slug);
+            if (numericId) {
+              courseId = numericId;
+            } else {
+              sendResponse({
+                success: false,
+                error: '無法解析課程 ID，請重新整理頁面',
+                errorType: 'no_course_id'
+              });
+              return;
+            }
+          }
 
           if (!courseId) {
             sendResponse({
@@ -253,79 +159,31 @@
             return;
           }
 
+          // 用 API 確認登入狀態
+          const loginStatus = await checkLoginViaAPI(courseId);
+
+          if (loginStatus.isLoggedIn === false) {
+            sendResponse({ success: false, error: loginStatus.reason, errorType: 'not_logged_in' });
+            return;
+          }
+          if (loginStatus.hasAccess === false) {
+            sendResponse({ success: false, error: loginStatus.reason, errorType: 'no_access' });
+            return;
+          }
+
           const courseTitle = getCourseTitle();
-          console.log('Course Title:', courseTitle);
-
-          // 使用 API 獲取課程結構
-          const chapters = await fetchCourseStructure(courseId);
-          console.log('Chapters:', chapters.length);
-
-          const totalLectures = chapters.reduce((sum, ch) => sum + ch.lectures.length, 0);
+          const availableLocales = await getAvailableLocales(courseId);
 
           sendResponse({
             success: true,
             data: {
-              courseId: courseId,
+              courseId,
               title: courseTitle,
-              chapters: chapters,
-              totalChapters: chapters.length,
-              totalLectures: totalLectures
+              availableLocales,
             }
           });
         } catch (error) {
-          console.error('getCourseInfo error:', error);
-          sendResponse({
-            success: false,
-            error: error.message
-          });
-        }
-      })();
-      return true; // 保持消息通道開啟
-    }
-
-    else if (request.action === 'getLectureTranscript') {
-      (async () => {
-        try {
-          const { courseId, lectureId, includeTimestamps } = request;
-          console.log(`Fetching transcript for lecture ${lectureId}`);
-
-          const result = await fetchLectureCaption(courseId, lectureId);
-
-          if (result) {
-            // 重新解析 VTT 根據時間戳記設定
-            if (result.transcript && !includeTimestamps) {
-              // 需要重新下載並解析
-              const response = await fetch(
-                `https://www.udemy.com/api-2.0/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset,title&fields[asset]=captions`,
-                { credentials: 'include' }
-              );
-              const data = await response.json();
-              const captions = data.asset?.captions || [];
-              let caption = captions.find(c => c.locale_id?.startsWith('en')) || captions[0];
-
-              if (caption && caption.url) {
-                const vttResponse = await fetch(caption.url);
-                const vttContent = await vttResponse.text();
-                result.transcript = parseVTT(vttContent, includeTimestamps);
-              }
-            }
-
-            sendResponse({
-              success: true,
-              data: result
-            });
-          } else {
-            sendResponse({
-              success: false,
-              error: '無法獲取字幕'
-            });
-          }
-        } catch (error) {
-          console.error('getLectureTranscript error:', error);
-          sendResponse({
-            success: false,
-            error: error.message
-          });
+          sendResponse({ success: false, error: error.message });
         }
       })();
       return true;
@@ -334,5 +192,5 @@
     return true;
   });
 
-  console.log('Udemy Transcript Downloader: Content script loaded (API version)');
+  console.log('Udemy Transcript Downloader v2.0: Content script loaded');
 })();
