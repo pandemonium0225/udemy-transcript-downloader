@@ -233,7 +233,7 @@ async function proxyFetchWithRetry(tabId, url, retries = CONFIG.MAX_RETRIES) {
 // ============================================================
 async function fetchCourseStructure(tabId, courseId) {
   const allItems = [];
-  let nextUrl = `${CONFIG.API_BASE}/courses/${courseId}/subscriber-curriculum-items/?page_size=${CONFIG.PAGE_SIZE}&fields[lecture]=title,asset&fields[chapter]=title&fields[asset]=captions`;
+  let nextUrl = `${CONFIG.API_BASE}/courses/${courseId}/subscriber-curriculum-items/?page_size=${CONFIG.PAGE_SIZE}&fields[lecture]=title,asset&fields[chapter]=title&fields[asset]=captions&fields[caption]=url,locale_id`;
 
   while (nextUrl) {
     const result = await proxyFetchWithRetry(tabId, nextUrl);
@@ -268,7 +268,7 @@ async function fetchCourseStructure(tabId, courseId) {
 
 // 取得單個講座字幕
 async function fetchLectureCaption(tabId, courseId, lectureId, locale = 'en', includeTimestamps = true) {
-  const url = `${CONFIG.API_BASE}/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset,title&fields[asset]=captions`;
+  const url = `${CONFIG.API_BASE}/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset,title&fields[asset]=captions&fields[caption]=url,locale_id,title`;
   const result = await proxyFetchWithRetry(tabId, url);
 
   if (result.error) {
@@ -291,17 +291,30 @@ async function fetchLectureCaption(tabId, courseId, lectureId, locale = 'en', in
     return { title: data.title, transcript: null };
   }
 
-  // VTT 檔案不需要 cookie，可以直接 fetch
+  // 先嘗試直接 fetch VTT（CDN 簽名 URL 通常不需 cookie）
   try {
     const vttResponse = await fetchWithRetry(caption.url);
-    const vttContent = await vttResponse.text();
-    const transcript = parseVTT(vttContent, includeTimestamps);
-
-    return { title: data.title, transcript, locale: caption.locale_id };
+    if (vttResponse.ok) {
+      const vttContent = await vttResponse.text();
+      const transcript = parseVTT(vttContent, includeTimestamps);
+      return { title: data.title, transcript, locale: caption.locale_id };
+    }
   } catch (e) {
-    console.error('VTT fetch error:', e);
-    return { title: data.title, transcript: null };
+    console.warn('Direct VTT fetch failed, trying proxy:', e.message);
   }
+
+  // 直接 fetch 失敗時，透過頁面 context 代理存取
+  try {
+    const vttResult = await proxyFetchWithRetry(tabId, caption.url);
+    if (!vttResult.error) {
+      const transcript = parseVTT(vttResult.body, includeTimestamps);
+      return { title: data.title, transcript, locale: caption.locale_id };
+    }
+  } catch (e) {
+    console.error('Proxy VTT fetch also failed:', e.message);
+  }
+
+  return { title: data.title, transcript: null };
 }
 
 // ============================================================
