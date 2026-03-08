@@ -85,21 +85,24 @@
   // 取得可用的字幕語言列表
   async function getAvailableLocales(courseId) {
     try {
-      const response = await fetch(
-        `https://www.udemy.com/api-2.0/courses/${courseId}/subscriber-curriculum-items/?page_size=1&fields[lecture]=asset&fields[asset]=captions`,
-        { credentials: 'include' }
-      );
-      if (!response.ok) return [];
-
-      const data = await response.json();
       const locales = new Set();
+      let nextUrl = `https://www.udemy.com/api-2.0/courses/${courseId}/subscriber-curriculum-items/?page_size=100&fields[lecture]=asset&fields[asset]=captions&fields[caption]=locale_id`;
 
-      for (const item of data.results) {
-        if (item._class === 'lecture' && item.asset && item.asset.captions) {
-          for (const cap of item.asset.captions) {
-            if (cap.locale_id) locales.add(cap.locale_id);
+      while (nextUrl) {
+        const response = await fetch(nextUrl, { credentials: 'include' });
+        if (!response.ok) return Array.from(locales);
+
+        const data = await response.json();
+
+        for (const item of data.results || []) {
+          if (item._class === 'lecture' && item.asset && item.asset.captions) {
+            for (const cap of item.asset.captions) {
+              if (cap.locale_id) locales.add(cap.locale_id);
+            }
           }
         }
+
+        nextUrl = data.next;
       }
 
       return Array.from(locales);

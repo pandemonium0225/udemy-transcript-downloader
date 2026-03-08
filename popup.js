@@ -1,4 +1,4 @@
-// Udemy Transcript Downloader - Popup Script (v2.0)
+// Udemy Transcript Downloader - Popup Script (v2.1)
 // 純 UI 控制器：顯示資訊、發送指令給 background.js
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -14,6 +14,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const selectNoneBtn = document.getElementById('select-none');
   const includeTimestamps = document.getElementById('include-timestamps');
   const localeSelect = document.getElementById('locale-select');
+  const selectionSummary = document.getElementById('selection-summary');
   const progressSection = document.querySelector('.progress-section');
   const progressFill = document.getElementById('progress-fill');
   const progressText = document.getElementById('progress-text');
@@ -44,7 +45,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function sendToContentScript(action, data = {}) {
-    // 嘗試注入 content script
     try {
       await chrome.scripting.executeScript({
         target: { tabId: currentTab.id },
@@ -70,8 +70,76 @@ document.addEventListener('DOMContentLoaded', async () => {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  function sanitizeFilename(name) {
-    return name.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, ' ').trim().substring(0, 100);
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function getLectureCheckboxes(chapterIndex) {
+    return Array.from(
+      chaptersList.querySelectorAll(`.lecture-checkbox[data-chapter-index="${chapterIndex}"]`)
+    );
+  }
+
+  function buildAllChapterPlans() {
+    if (!courseData) return [];
+
+    return courseData.chapters
+      .map((chapter, chapterIndex) => ({
+        chapterIndex,
+        lectureIndices: chapter.lectures.map((_, lectureIndex) => lectureIndex),
+      }))
+      .filter(plan => plan.lectureIndices.length > 0);
+  }
+
+  function getSelectedChapterPlans() {
+    if (!courseData) return [];
+
+    return courseData.chapters
+      .map((_, chapterIndex) => {
+        const lectureIndices = getLectureCheckboxes(chapterIndex)
+          .filter(checkbox => checkbox.checked)
+          .map(checkbox => parseInt(checkbox.dataset.lectureIndex, 10));
+
+        return lectureIndices.length > 0 ? { chapterIndex, lectureIndices } : null;
+      })
+      .filter(Boolean);
+  }
+
+  function syncChapterCheckbox(chapterIndex) {
+    const chapterCheckbox = chaptersList.querySelector(`.chapter-checkbox[data-index="${chapterIndex}"]`);
+    if (!chapterCheckbox) return;
+
+    const lectureCheckboxes = getLectureCheckboxes(chapterIndex);
+    const checkedCount = lectureCheckboxes.filter(checkbox => checkbox.checked).length;
+
+    chapterCheckbox.checked = checkedCount > 0 && checkedCount === lectureCheckboxes.length;
+    chapterCheckbox.indeterminate = checkedCount > 0 && checkedCount < lectureCheckboxes.length;
+  }
+
+  function syncAllChapterCheckboxes() {
+    if (!courseData) return;
+    courseData.chapters.forEach((_, chapterIndex) => syncChapterCheckbox(chapterIndex));
+  }
+
+  function updateSelectionSummary() {
+    const chapterPlans = getSelectedChapterPlans();
+    const lectureCount = chapterPlans.reduce((sum, plan) => sum + plan.lectureIndices.length, 0);
+
+    if (lectureCount === 0) {
+      selectionSummary.textContent = '目前未選擇任何講座';
+      downloadBtn.disabled = true;
+      downloadAllBtn.disabled = false;
+      return;
+    }
+
+    selectionSummary.textContent = `已選擇 ${chapterPlans.length} 個章節中的 ${lectureCount} 個講座`;
+    downloadBtn.disabled = false;
+    downloadAllBtn.disabled = false;
   }
 
   // ============================================================
@@ -109,26 +177,56 @@ document.addEventListener('DOMContentLoaded', async () => {
   function renderChapters(chapters) {
     if (!chapters || chapters.length === 0) {
       chaptersList.innerHTML = '<p class="loading">找不到章節，請確保課程內容已載入</p>';
+      selectionSummary.textContent = '目前未選擇任何講座';
       return;
     }
 
-    chaptersList.innerHTML = chapters.map((chapter, index) => `
-      <div class="chapter-item">
-        <input type="checkbox" id="chapter-${index}" data-index="${index}" checked>
-        <label for="chapter-${index}">
-          <span class="chapter-title">${chapter.title || `Chapter ${index + 1}`}</span>
-          <span class="chapter-lectures">${chapter.lectures.length} 個講座</span>
-        </label>
-      </div>
-    `).join('');
+    chaptersList.innerHTML = chapters.map((chapter, chapterIndex) => {
+      const chapterTitle = escapeHtml(chapter.title || `Chapter ${chapterIndex + 1}`);
+      const lectureItems = chapter.lectures.map((lecture, lectureIndex) => {
+        const lectureTitle = escapeHtml(lecture.title || `Lecture ${lectureIndex + 1}`);
+        const lectureMeta = lecture.hasCaptions
+          ? '偵測到字幕來源'
+          : '未預先偵測到字幕，仍會嘗試抓取';
 
-    downloadBtn.disabled = false;
-    downloadAllBtn.disabled = false;
-  }
+        return `
+          <div class="lecture-item ${lecture.hasCaptions ? '' : 'lecture-no-captions'}">
+            <input
+              type="checkbox"
+              id="lecture-${chapterIndex}-${lectureIndex}"
+              class="lecture-checkbox"
+              data-chapter-index="${chapterIndex}"
+              data-lecture-index="${lectureIndex}"
+            >
+            <label for="lecture-${chapterIndex}-${lectureIndex}">
+              <span class="lecture-title">${String(lectureIndex + 1).padStart(2, '0')}. ${lectureTitle}</span>
+              <span class="lecture-meta">${lectureMeta}</span>
+            </label>
+          </div>
+        `;
+      }).join('');
 
-  function getSelectedChapters() {
-    const checkboxes = chaptersList.querySelectorAll('input[type="checkbox"]:checked');
-    return Array.from(checkboxes).map(cb => parseInt(cb.dataset.index));
+      return `
+        <div class="chapter-card">
+          <div class="chapter-item">
+            <div class="chapter-main">
+              <input type="checkbox" id="chapter-${chapterIndex}" class="chapter-checkbox" data-index="${chapterIndex}">
+              <label for="chapter-${chapterIndex}">
+                <span class="chapter-title">${chapterTitle}</span>
+                <span class="chapter-lectures">${chapter.lectures.length} 個講座</span>
+              </label>
+            </div>
+            <button type="button" class="btn-small toggle-lectures" data-index="${chapterIndex}" aria-expanded="true">收合</button>
+          </div>
+          <div class="lectures-list" id="lectures-${chapterIndex}">
+            ${lectureItems}
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    syncAllChapterCheckboxes();
+    updateSelectionSummary();
   }
 
   function renderLocaleSelect(locales) {
@@ -138,25 +236,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     const localeNames = {
-      'en_US': 'English (US)',
-      'en_GB': 'English (UK)',
-      'zh_TW': '繁體中文',
-      'zh_CN': '簡體中文',
-      'ja_JP': '日本語',
-      'ko_KR': '한국어',
-      'es_ES': 'Español',
-      'fr_FR': 'Français',
-      'de_DE': 'Deutsch',
-      'pt_BR': 'Português (BR)',
-      'it_IT': 'Italiano',
-      'vi_VN': 'Tiếng Việt',
-      'th_TH': 'ไทย',
-      'id_ID': 'Bahasa Indonesia',
+      en: 'English',
+      en_US: 'English (US)',
+      en_GB: 'English (UK)',
+      zh_TW: '繁體中文',
+      zh_CN: '簡體中文',
+      ja_JP: '日本語',
+      ko_KR: '한국어',
+      es_ES: 'Español',
+      fr_FR: 'Français',
+      de_DE: 'Deutsch',
+      pt_BR: 'Português (BR)',
+      it_IT: 'Italiano',
+      vi_VN: 'Tiếng Việt',
+      th_TH: 'ไทย',
+      id_ID: 'Bahasa Indonesia',
     };
 
-    localeSelect.innerHTML = locales.map(loc => {
-      const name = localeNames[loc] || loc;
-      return `<option value="${loc}">${name}</option>`;
+    localeSelect.innerHTML = locales.map(locale => {
+      const name = localeNames[locale] || locale;
+      return `<option value="${escapeHtml(locale)}">${escapeHtml(name)}</option>`;
     }).join('');
   }
 
@@ -181,19 +280,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 下載動作
   // ============================================================
   async function startDownload(mergeMode) {
-    const selectedIndices = mergeMode ? null : getSelectedChapters();
+    const selectedChapterPlans = mergeMode ? buildAllChapterPlans() : getSelectedChapterPlans();
 
-    if (!mergeMode && selectedIndices.length === 0) {
-      showStatus('請至少選擇一個章節', 'error');
+    if (selectedChapterPlans.length === 0) {
+      showStatus('請至少選擇一個講座', 'error');
       return;
     }
 
     const options = {
       includeTimestamps: includeTimestamps.checked,
       locale: localeSelect.value,
-      selectedIndices: mergeMode
-        ? courseData.chapters.map((_, i) => i)
-        : selectedIndices,
+      selectedChapterPlans,
       mergeMode,
     };
 
@@ -227,7 +324,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           showStatus(`下載失敗: ${error}`, 'error');
         } else if (progress.processedLectures > 0) {
           showStatus(
-            `下載完成！(${progress.successCount}/${progress.totalLectures} 個講座有字幕)`,
+            `下載完成！(${progress.successCount}/${progress.totalLectures} 個講座成功取得字幕)`,
             'success'
           );
         }
@@ -247,7 +344,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
 
-      // 先檢查是否有正在執行的下載
       const bgState = await sendToBackground('getDownloadState');
       if (bgState && bgState.isRunning) {
         showRunningUI(bgState.isPaused);
@@ -255,17 +351,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
 
+      downloadBtn.disabled = true;
+      downloadAllBtn.disabled = true;
       chaptersList.innerHTML = '<p class="loading">正在載入課程結構...</p>';
 
-      // 從 content script 取得課程基本資訊
       const result = await sendToContentScript('getCourseInfo');
 
       if (result && result.success) {
         hideAllErrors();
 
         const { courseId, title, availableLocales } = result.data;
-
-        // 用 background 的 API 代理取得完整課程結構
         const structResult = await sendToBackground('fetchCourseInfo', {
           tabId: currentTab.id,
           courseId,
@@ -287,7 +382,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
           chaptersList.innerHTML = `<p class="loading">${structResult?.error || '無法載入課程結構'}</p>`;
         }
-
       } else if (result && !result.success) {
         if (result.errorType === 'not_logged_in') showError('not_logged_in');
         else if (result.errorType === 'no_access') showError('no_access', result.error);
@@ -305,11 +399,52 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 事件綁定
   // ============================================================
   selectAllBtn.addEventListener('click', () => {
-    chaptersList.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = true);
+    chaptersList.querySelectorAll('input[type="checkbox"]').forEach(checkbox => {
+      checkbox.checked = true;
+    });
+    syncAllChapterCheckboxes();
+    updateSelectionSummary();
   });
 
   selectNoneBtn.addEventListener('click', () => {
-    chaptersList.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
+    chaptersList.querySelectorAll('input[type="checkbox"]').forEach(checkbox => {
+      checkbox.checked = false;
+    });
+    syncAllChapterCheckboxes();
+    updateSelectionSummary();
+  });
+
+  chaptersList.addEventListener('change', (event) => {
+    const target = event.target;
+
+    if (target.classList.contains('chapter-checkbox')) {
+      const chapterIndex = parseInt(target.dataset.index, 10);
+      getLectureCheckboxes(chapterIndex).forEach(checkbox => {
+        checkbox.checked = target.checked;
+      });
+      syncChapterCheckbox(chapterIndex);
+      updateSelectionSummary();
+      return;
+    }
+
+    if (target.classList.contains('lecture-checkbox')) {
+      const chapterIndex = parseInt(target.dataset.chapterIndex, 10);
+      syncChapterCheckbox(chapterIndex);
+      updateSelectionSummary();
+    }
+  });
+
+  chaptersList.addEventListener('click', (event) => {
+    const toggleButton = event.target.closest('.toggle-lectures');
+    if (!toggleButton) return;
+
+    const chapterIndex = toggleButton.dataset.index;
+    const lectureList = document.getElementById(`lectures-${chapterIndex}`);
+    const isExpanded = toggleButton.getAttribute('aria-expanded') === 'true';
+
+    lectureList.classList.toggle('is-collapsed', isExpanded);
+    toggleButton.setAttribute('aria-expanded', String(!isExpanded));
+    toggleButton.textContent = isExpanded ? '展開' : '收合';
   });
 
   downloadBtn.addEventListener('click', () => startDownload(false));
@@ -334,6 +469,5 @@ document.addEventListener('DOMContentLoaded', async () => {
     showStatus('已取消下載', 'info');
   });
 
-  // 啟動
   init();
 });

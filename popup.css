@@ -111,6 +111,12 @@ h3 {
   margin-bottom: 8px;
 }
 
+.selection-summary {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #6a6f73;
+}
+
 .select-buttons {
   display: flex;
   gap: 8px;
@@ -141,14 +147,28 @@ h3 {
 .chapter-item {
   display: flex;
   align-items: flex-start;
+  justify-content: space-between;
   gap: 8px;
   padding: 8px;
   border-radius: 4px;
-  cursor: pointer;
 }
 
 .chapter-item:hover {
   background: #f7f9fa;
+}
+
+.chapter-card + .chapter-card {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #f0f2f4;
+}
+
+.chapter-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
 }
 
 .chapter-item input[type="checkbox"] {
@@ -175,6 +195,65 @@ h3 {
 .chapter-lectures {
   font-size: 11px;
   color: #6a6f73;
+}
+
+.toggle-lectures {
+  flex-shrink: 0;
+}
+
+.lectures-list {
+  margin-top: 4px;
+  margin-left: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.lectures-list.is-collapsed {
+  display: none;
+}
+
+.lecture-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+}
+
+.lecture-item:hover {
+  background: #f7f9fa;
+}
+
+.lecture-item input[type="checkbox"] {
+  margin-top: 2px;
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.lecture-item label {
+  cursor: pointer;
+  flex: 1;
+}
+
+.lecture-title {
+  display: block;
+  font-size: 12px;
+  color: #1c1d1f;
+  line-height: 1.4;
+}
+
+.lecture-meta {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: #6a6f73;
+}
+
+.lecture-no-captions .lecture-meta {
+  color: #992800;
 }
 
 /* Progress */

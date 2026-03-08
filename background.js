@@ -23,7 +23,7 @@ let downloadState = {
   isPaused: false,
   courseData: null,
   tabId: null,
-  options: {},            // { includeTimestamps, locale, selectedIndices, mergeMode }
+  options: {},            // { includeTimestamps, locale, selectedChapterPlans, mergeMode }
   progress: {
     currentChapterIdx: 0,
     currentLectureIdx: 0,
@@ -90,29 +90,66 @@ async function fetchWithRetry(url, options = {}, retries = CONFIG.MAX_RETRIES) {
 }
 
 // ============================================================
-// VTT 解析 (含去重邏輯)
+// 字幕解析
 // ============================================================
+function normalizeWhitespace(text) {
+  return String(text ?? '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractTimestampLabel(value) {
+  if (value === null || value === undefined || value === '') {
+    return '';
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const totalSeconds = Math.max(0, Math.floor(value));
+    const hours = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+    const minutes = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+    const seconds = String(totalSeconds % 60).padStart(2, '0');
+    return hours === '00' ? `${minutes}:${seconds}` : `${hours}:${minutes}:${seconds}`;
+  }
+
+  const text = String(value).trim();
+  const timeMatch = text.match(/(\d{2}:\d{2}(?::\d{2})?)/);
+  if (timeMatch) {
+    return timeMatch[1];
+  }
+
+  const numericValue = Number(text);
+  if (Number.isFinite(numericValue)) {
+    return extractTimestampLabel(numericValue);
+  }
+
+  return '';
+}
+
+function appendTranscriptLine(result, seenTexts, text, timestamp, includeTimestamps) {
+  const cleanText = normalizeWhitespace(text);
+  if (!cleanText || seenTexts.has(cleanText)) {
+    return;
+  }
+
+  seenTexts.add(cleanText);
+  result.push(includeTimestamps && timestamp ? `[${timestamp}] ${cleanText}` : cleanText);
+}
+
 function parseVTT(vttContent, includeTimestamps = true) {
-  const lines = vttContent.split('\n');
+  const lines = String(vttContent).replace(/\r/g, '').split('\n');
   const result = [];
+  const seenTexts = new Set();
   let currentTime = '';
   let currentText = [];
-  const seenTexts = new Set(); // 去重用
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
 
-    if (line === 'WEBVTT' || line === '' || line.startsWith('NOTE')) {
+    if (!line || line === 'WEBVTT' || line.startsWith('NOTE') || line.startsWith('STYLE')) {
       if (currentText.length > 0) {
-        const text = currentText.join(' ');
-        if (!seenTexts.has(text)) {
-          seenTexts.add(text);
-          if (includeTimestamps && currentTime) {
-            result.push(`[${currentTime}] ${text}`);
-          } else {
-            result.push(text);
-          }
-        }
+        appendTranscriptLine(result, seenTexts, currentText.join(' '), currentTime, includeTimestamps);
         currentText = [];
       }
       continue;
@@ -120,20 +157,41 @@ function parseVTT(vttContent, includeTimestamps = true) {
 
     if (line.includes('-->')) {
       if (currentText.length > 0) {
-        const text = currentText.join(' ');
-        if (!seenTexts.has(text)) {
-          seenTexts.add(text);
-          if (includeTimestamps && currentTime) {
-            result.push(`[${currentTime}] ${text}`);
-          } else {
-            result.push(text);
-          }
-        }
+        appendTranscriptLine(result, seenTexts, currentText.join(' '), currentTime, includeTimestamps);
         currentText = [];
       }
-      const timeMatch = line.match(/^(\d{2}:\d{2})/);
-      if (timeMatch) {
-        currentTime = timeMatch[1];
+      currentTime = extractTimestampLabel(line);
+      continue;
+    }
+
+    if (/^\d+$/.test(line)) {
+      continue;
+    }
+
+    currentText.push(line);
+  }
+
+  if (currentText.length > 0) {
+    appendTranscriptLine(result, seenTexts, currentText.join(' '), currentTime, includeTimestamps);
+  }
+
+  return result.join('\n');
+}
+
+function parseSRT(srtContent, includeTimestamps = true) {
+  const lines = String(srtContent).replace(/\r/g, '').split('\n');
+  const result = [];
+  const seenTexts = new Set();
+  let currentTime = '';
+  let currentText = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      if (currentText.length > 0) {
+        appendTranscriptLine(result, seenTexts, currentText.join(' '), currentTime, includeTimestamps);
+        currentText = [];
       }
       continue;
     }
@@ -142,27 +200,228 @@ function parseVTT(vttContent, includeTimestamps = true) {
       continue;
     }
 
-    if (line.length > 0) {
-      const cleanText = line.replace(/<[^>]*>/g, '');
-      if (cleanText) {
-        currentText.push(cleanText);
+    if (line.includes('-->')) {
+      if (currentText.length > 0) {
+        appendTranscriptLine(result, seenTexts, currentText.join(' '), currentTime, includeTimestamps);
+        currentText = [];
       }
+      currentTime = extractTimestampLabel(line);
+      continue;
     }
+
+    currentText.push(line);
   }
 
-  // 處理最後一段
   if (currentText.length > 0) {
-    const text = currentText.join(' ');
-    if (!seenTexts.has(text)) {
-      if (includeTimestamps && currentTime) {
-        result.push(`[${currentTime}] ${text}`);
-      } else {
-        result.push(text);
-      }
-    }
+    appendTranscriptLine(result, seenTexts, currentText.join(' '), currentTime, includeTimestamps);
   }
 
   return result.join('\n');
+}
+
+function parseCaptionJson(payload, includeTimestamps = true) {
+  if (!payload) {
+    return null;
+  }
+
+  if (typeof payload === 'string') {
+    const text = normalizeWhitespace(payload);
+    return text || null;
+  }
+
+  if (Array.isArray(payload)) {
+    const result = [];
+    const seenTexts = new Set();
+
+    payload.forEach(item => {
+      if (typeof item === 'string') {
+        appendTranscriptLine(result, seenTexts, item, '', includeTimestamps);
+        return;
+      }
+
+      if (!item || typeof item !== 'object') {
+        return;
+      }
+
+      const segmentText = Array.isArray(item.segs)
+        ? item.segs.map(seg => seg.utf8 || seg.text || seg.content || '').join('')
+        : item.text || item.content || item.caption || item.value || item.line || item.transcript || item.utf8 || '';
+
+      const timestamp = extractTimestampLabel(
+        item.start ?? item.startTime ?? item.start_time ?? item.from ?? item.offset ?? item.begin ?? item.time
+      );
+
+      appendTranscriptLine(result, seenTexts, segmentText, timestamp, includeTimestamps);
+    });
+
+    return result.length > 0 ? result.join('\n') : null;
+  }
+
+  const nestedList = payload.cues
+    || payload.events
+    || payload.captions
+    || payload.results
+    || payload.segments
+    || payload.transcript;
+
+  if (nestedList) {
+    return parseCaptionJson(nestedList, includeTimestamps);
+  }
+
+  if (typeof payload.text === 'string') {
+    return normalizeWhitespace(payload.text) || null;
+  }
+
+  return null;
+}
+
+function extractTranscriptFromBody(body, includeTimestamps = true) {
+  if (!body) {
+    return null;
+  }
+
+  const trimmed = String(body).trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (/^<!doctype html/i.test(trimmed) || /^<html/i.test(trimmed)) {
+    return null;
+  }
+
+  if (trimmed.startsWith('WEBVTT')) {
+    return parseVTT(trimmed, includeTimestamps) || null;
+  }
+
+  if (trimmed.includes('-->') && trimmed.includes(',')) {
+    const srtTranscript = parseSRT(trimmed, includeTimestamps);
+    if (srtTranscript) {
+      return srtTranscript;
+    }
+  }
+
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const jsonTranscript = parseCaptionJson(parsed, includeTimestamps);
+      if (jsonTranscript) {
+        return jsonTranscript;
+      }
+    } catch (error) {
+      console.warn('Caption JSON parse failed:', error.message);
+    }
+  }
+
+  const plainText = normalizeWhitespace(trimmed);
+  return plainText || null;
+}
+
+function normalizeCaptionUrl(url) {
+  if (!url) {
+    return '';
+  }
+
+  if (/^https?:\/\//i.test(url)) {
+    return url;
+  }
+
+  if (url.startsWith('//')) {
+    return `https:${url}`;
+  }
+
+  if (url.startsWith('/')) {
+    return `https://www.udemy.com${url}`;
+  }
+
+  return url;
+}
+
+function buildLocaleVariants(locale) {
+  const variants = new Set();
+  const normalizedLocale = String(locale || 'en').trim();
+
+  if (normalizedLocale) {
+    variants.add(normalizedLocale.toLowerCase());
+    variants.add(normalizedLocale.replace('-', '_').toLowerCase());
+    variants.add(normalizedLocale.replace('_', '-').toLowerCase());
+
+    const language = normalizedLocale.split(/[-_]/)[0];
+    if (language) {
+      variants.add(language.toLowerCase());
+    }
+  }
+
+  variants.add('en');
+  return Array.from(variants);
+}
+
+function collectCaptionTracks(payload) {
+  const rawTracks = [];
+  const containers = [
+    payload?.asset?.captions,
+    payload?.captions,
+    payload?.asset?.tracks,
+    payload?.tracks,
+    payload?.asset?.text_tracks,
+    payload?.text_tracks,
+  ];
+
+  containers.forEach(container => {
+    if (Array.isArray(container)) {
+      rawTracks.push(...container);
+    }
+  });
+
+  if (payload?.asset?.caption_urls && typeof payload.asset.caption_urls === 'object') {
+    Object.entries(payload.asset.caption_urls).forEach(([locale, url]) => {
+      rawTracks.push({ locale_id: locale, url });
+    });
+  }
+
+  const uniqueTracks = new Map();
+
+  rawTracks.forEach(track => {
+    if (!track || typeof track !== 'object') {
+      return;
+    }
+
+    const url = normalizeCaptionUrl(
+      track.url || track.src || track.file || track.file_url || track.webvtt_url || track.vtt_url
+    );
+
+    if (!url) {
+      return;
+    }
+
+    const locale = String(track.locale_id || track.locale || track.language || '').trim();
+    const key = `${locale}|${url}`;
+
+    if (!uniqueTracks.has(key)) {
+      uniqueTracks.set(key, { locale, url });
+    }
+  });
+
+  return Array.from(uniqueTracks.values());
+}
+
+function selectCaptionTracks(tracks, preferredLocale) {
+  const localeVariants = buildLocaleVariants(preferredLocale);
+
+  const rankTrack = (track) => {
+    const locale = String(track.locale || '').toLowerCase().replace('-', '_');
+    if (!locale) return 50;
+
+    for (let i = 0; i < localeVariants.length; i++) {
+      const variant = localeVariants[i].replace('-', '_');
+      if (locale === variant) return i;
+      if (locale.startsWith(`${variant}_`)) return i + 10;
+    }
+
+    if (locale.startsWith('en')) return 80;
+    return 100;
+  };
+
+  return [...tracks].sort((a, b) => rankTrack(a) - rankTrack(b));
 }
 
 // ============================================================
@@ -172,9 +431,14 @@ async function proxyFetch(tabId, url) {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
+      world: 'MAIN',
       func: async (apiUrl) => {
         try {
-          const resp = await fetch(apiUrl, { credentials: 'include' });
+          const targetUrl = new URL(apiUrl, window.location.href).toString();
+          const shouldIncludeCredentials = targetUrl.startsWith(window.location.origin);
+          const resp = await fetch(targetUrl, {
+            credentials: shouldIncludeCredentials ? 'include' : 'omit',
+          });
           if (!resp.ok) {
             return { error: true, status: resp.status, statusText: resp.statusText };
           }
@@ -233,7 +497,7 @@ async function proxyFetchWithRetry(tabId, url, retries = CONFIG.MAX_RETRIES) {
 // ============================================================
 async function fetchCourseStructure(tabId, courseId) {
   const allItems = [];
-  let nextUrl = `${CONFIG.API_BASE}/courses/${courseId}/subscriber-curriculum-items/?page_size=${CONFIG.PAGE_SIZE}&fields[lecture]=title,asset&fields[chapter]=title&fields[asset]=captions&fields[caption]=url,locale_id`;
+  let nextUrl = `${CONFIG.API_BASE}/courses/${courseId}/subscriber-curriculum-items/?page_size=${CONFIG.PAGE_SIZE}&fields[lecture]=title,asset&fields[chapter]=title&fields[asset]=captions,text_tracks&fields[caption]=url,locale_id`;
 
   while (nextUrl) {
     const result = await proxyFetchWithRetry(tabId, nextUrl);
@@ -255,10 +519,11 @@ async function fetchCourseStructure(tabId, courseId) {
       currentChapter = { id: item.id, title: item.title, lectures: [] };
       chapters.push(currentChapter);
     } else if (item._class === 'lecture' && currentChapter) {
+      const captionTracks = collectCaptionTracks(item);
       currentChapter.lectures.push({
         id: item.id,
         title: item.title,
-        hasCaptions: item.asset && item.asset.captions && item.asset.captions.length > 0,
+        hasCaptions: captionTracks.length > 0,
       });
     }
   });
@@ -268,7 +533,7 @@ async function fetchCourseStructure(tabId, courseId) {
 
 // 取得單個講座字幕
 async function fetchLectureCaption(tabId, courseId, lectureId, locale = 'en', includeTimestamps = true) {
-  const url = `${CONFIG.API_BASE}/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset,title&fields[asset]=captions&fields[caption]=url,locale_id,title`;
+  const url = `${CONFIG.API_BASE}/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset,title,captions&fields[asset]=captions,text_tracks,caption_urls&fields[caption]=url,locale_id,title`;
   const result = await proxyFetchWithRetry(tabId, url);
 
   if (result.error) {
@@ -278,40 +543,36 @@ async function fetchLectureCaption(tabId, courseId, lectureId, locale = 'en', in
 
   const data = JSON.parse(result.body);
 
-  if (!data.asset || !data.asset.captions || data.asset.captions.length === 0) {
+  const captionTracks = selectCaptionTracks(collectCaptionTracks(data), locale || 'en');
+  if (captionTracks.length === 0) {
     return { title: data.title, transcript: null };
   }
 
-  const captions = data.asset.captions;
-  let caption = captions.find(c => c.locale_id && c.locale_id.startsWith(locale));
-  if (!caption) caption = captions.find(c => c.locale_id && c.locale_id.startsWith('en'));
-  if (!caption) caption = captions[0];
-
-  if (!caption || !caption.url) {
-    return { title: data.title, transcript: null };
-  }
-
-  // 先嘗試直接 fetch VTT（CDN 簽名 URL 通常不需 cookie）
-  try {
-    const vttResponse = await fetchWithRetry(caption.url);
-    if (vttResponse.ok) {
-      const vttContent = await vttResponse.text();
-      const transcript = parseVTT(vttContent, includeTimestamps);
-      return { title: data.title, transcript, locale: caption.locale_id };
+  for (const track of captionTracks) {
+    try {
+      const proxyResult = await proxyFetchWithRetry(tabId, track.url);
+      if (!proxyResult.error) {
+        const transcript = extractTranscriptFromBody(proxyResult.body, includeTimestamps);
+        if (transcript) {
+          return { title: data.title, transcript, locale: track.locale };
+        }
+      }
+    } catch (error) {
+      console.warn('Page-world caption fetch failed:', error.message, track.url);
     }
-  } catch (e) {
-    console.warn('Direct VTT fetch failed, trying proxy:', e.message);
-  }
 
-  // 直接 fetch 失敗時，透過頁面 context 代理存取
-  try {
-    const vttResult = await proxyFetchWithRetry(tabId, caption.url);
-    if (!vttResult.error) {
-      const transcript = parseVTT(vttResult.body, includeTimestamps);
-      return { title: data.title, transcript, locale: caption.locale_id };
+    try {
+      const directResponse = await fetchWithRetry(track.url);
+      if (directResponse.ok) {
+        const responseBody = await directResponse.text();
+        const transcript = extractTranscriptFromBody(responseBody, includeTimestamps);
+        if (transcript) {
+          return { title: data.title, transcript, locale: track.locale };
+        }
+      }
+    } catch (error) {
+      console.warn('Extension caption fetch failed:', error.message, track.url);
     }
-  } catch (e) {
-    console.error('Proxy VTT fetch also failed:', e.message);
   }
 
   return { title: data.title, transcript: null };
@@ -329,6 +590,7 @@ async function saveState() {
     options: downloadState.options,
     progress: downloadState.progress,
     completedLectures: downloadState.completedLectures,
+    chapterContents: downloadState.chapterContents,
     error: downloadState.error,
   };
   await chrome.storage.local.set({ downloadState: stateToSave });
@@ -383,26 +645,81 @@ function downloadTextFile(content, filename) {
 // ============================================================
 // 核心下載引擎
 // ============================================================
-async function startDownload(tabId, courseData, options) {
-  const { includeTimestamps, locale, selectedIndices, mergeMode } = options;
+function normalizeChapterPlans(courseData, selectedChapterPlans = null, selectedIndices = null) {
+  const rawPlans = Array.isArray(selectedChapterPlans) && selectedChapterPlans.length > 0
+    ? selectedChapterPlans
+    : Array.isArray(selectedIndices) && selectedIndices.length > 0
+      ? selectedIndices.map(chapterIndex => ({
+          chapterIndex,
+          lectureIndices: (courseData.chapters[chapterIndex]?.lectures || []).map((_, lectureIndex) => lectureIndex),
+        }))
+      : courseData.chapters.map((chapter, chapterIndex) => ({
+          chapterIndex,
+          lectureIndices: chapter.lectures.map((_, lectureIndex) => lectureIndex),
+        }));
+
+  return rawPlans
+    .map(plan => {
+      const chapter = courseData.chapters[plan.chapterIndex];
+      if (!chapter) return null;
+
+      const lectureIndices = Array.from(new Set(plan.lectureIndices || []))
+        .filter(index => Number.isInteger(index) && chapter.lectures[index])
+        .sort((a, b) => a - b);
+
+      return lectureIndices.length > 0
+        ? { chapterIndex: plan.chapterIndex, lectureIndices }
+        : null;
+    })
+    .filter(Boolean);
+}
+
+function countLecturesInPlans(chapterPlans) {
+  return chapterPlans.reduce((sum, plan) => sum + plan.lectureIndices.length, 0);
+}
+
+function createFreshProgress(totalLectures) {
+  return {
+    currentChapterIdx: 0,
+    currentLectureIdx: 0,
+    processedLectures: 0,
+    totalLectures,
+    successCount: 0,
+    currentLectureName: '',
+  };
+}
+
+async function startDownload(tabId, courseData, options, resume = false) {
+  const { includeTimestamps, locale, mergeMode } = options;
+  const chapterPlans = normalizeChapterPlans(courseData, options.selectedChapterPlans, options.selectedIndices);
   const courseId = courseData.courseId;
   const courseName = sanitizeFilename(courseData.title);
 
-  // 計算需處理的總講座數
-  let totalLectures = 0;
-  const indices = selectedIndices || courseData.chapters.map((_, i) => i);
-  indices.forEach(idx => {
-    totalLectures += courseData.chapters[idx].lectures.length;
-  });
+  if (chapterPlans.length === 0) {
+    throw new Error('沒有可下載的講座');
+  }
 
-  // 初始化或恢復狀態
+  const totalLectures = countLecturesInPlans(chapterPlans);
+
   downloadState.isRunning = true;
   downloadState.isPaused = false;
   downloadState.courseData = courseData;
   downloadState.tabId = tabId;
-  downloadState.options = options;
+  downloadState.options = {
+    includeTimestamps,
+    locale,
+    mergeMode,
+    selectedChapterPlans: chapterPlans,
+  };
   downloadState.error = null;
-  downloadState.progress.totalLectures = totalLectures;
+
+  if (!resume) {
+    downloadState.progress = createFreshProgress(totalLectures);
+    downloadState.completedLectures = {};
+    downloadState.chapterContents = {};
+  } else {
+    downloadState.progress.totalLectures = totalLectures;
+  }
 
   await saveState();
   broadcastProgress();
@@ -412,9 +729,9 @@ async function startDownload(tabId, courseData, options) {
 
   try {
     if (mergeMode) {
-      await downloadMerged(tabId, courseData, indices, courseName, courseId, includeTimestamps, locale);
+      await downloadMerged(tabId, courseData, chapterPlans, courseName, courseId, includeTimestamps, locale);
     } else {
-      await downloadByChapter(tabId, courseData, indices, courseName, courseId, includeTimestamps, locale);
+      await downloadByChapter(tabId, courseData, chapterPlans, courseName, courseId, includeTimestamps, locale);
     }
   } catch (error) {
     downloadState.error = error.message;
@@ -427,42 +744,44 @@ async function startDownload(tabId, courseData, options) {
   }
 }
 
-async function downloadByChapter(tabId, courseData, indices, courseName, courseId, includeTimestamps, locale) {
-  // 從斷點恢復：跳過已完成的章節
+async function downloadByChapter(tabId, courseData, chapterPlans, courseName, courseId, includeTimestamps, locale) {
   const startChapterPos = downloadState.progress.currentChapterIdx || 0;
 
-  for (let pos = startChapterPos; pos < indices.length; pos++) {
+  for (let pos = startChapterPos; pos < chapterPlans.length; pos++) {
     if (!downloadState.isRunning || downloadState.isPaused) {
       await saveState();
       return;
     }
 
-    const chapterIndex = indices[pos];
+    const { chapterIndex, lectureIndices } = chapterPlans[pos];
     const chapter = courseData.chapters[chapterIndex];
     const chapterNum = String(chapterIndex + 1).padStart(2, '0');
     const chapterName = sanitizeFilename(chapter.title);
+    let chapterContent = downloadState.chapterContents[chapterIndex];
 
-    let chapterContent = `${'='.repeat(60)}\n`;
-    chapterContent += `Chapter ${chapterNum}: ${chapter.title}\n`;
-    chapterContent += `${'='.repeat(60)}\n\n`;
+    if (!chapterContent) {
+      chapterContent = `${'='.repeat(60)}\n`;
+      chapterContent += `Chapter ${chapterNum}: ${chapter.title}\n`;
+      chapterContent += `${'='.repeat(60)}\n\n`;
+      downloadState.chapterContents[chapterIndex] = chapterContent;
+    }
 
-    const startLecture = (pos === startChapterPos) ? (downloadState.progress.currentLectureIdx || 0) : 0;
+    const startLecturePos = pos === startChapterPos ? (downloadState.progress.currentLectureIdx || 0) : 0;
 
-    for (let i = startLecture; i < chapter.lectures.length; i++) {
-      // 檢查暫停/停止
+    for (let lecturePos = startLecturePos; lecturePos < lectureIndices.length; lecturePos++) {
       while (downloadState.isPaused) {
         await sleep(1000);
         if (!downloadState.isRunning) return;
       }
       if (!downloadState.isRunning) return;
 
-      const lecture = chapter.lectures[i];
+      const lectureIndex = lectureIndices[lecturePos];
+      const lecture = chapter.lectures[lectureIndex];
       downloadState.progress.currentChapterIdx = pos;
-      downloadState.progress.currentLectureIdx = i;
       downloadState.progress.currentLectureName = lecture.title;
       broadcastProgress();
 
-      const lectureNum = String(i + 1).padStart(2, '0');
+      const lectureNum = String(lectureIndex + 1).padStart(2, '0');
       chapterContent += `${'-'.repeat(40)}\n`;
       chapterContent += `Lecture ${lectureNum}: ${lecture.title}\n`;
       chapterContent += `${'-'.repeat(40)}\n\n`;
@@ -484,7 +803,9 @@ async function downloadByChapter(tabId, courseData, indices, courseName, courseI
       }
 
       chapterContent += '\n\n';
+      downloadState.chapterContents[chapterIndex] = chapterContent;
       downloadState.progress.processedLectures++;
+      downloadState.progress.currentLectureIdx = lecturePos + 1;
       broadcastProgress();
 
       // 定期保存進度 (每 5 個講座)
@@ -500,27 +821,35 @@ async function downloadByChapter(tabId, courseData, indices, courseName, courseI
     downloadTextFile(chapterContent, filename);
     await sleep(300);
 
-    // 重設 lecture index
+    delete downloadState.chapterContents[chapterIndex];
+    downloadState.progress.currentChapterIdx = pos + 1;
     downloadState.progress.currentLectureIdx = 0;
+    await saveState();
   }
 }
 
-async function downloadMerged(tabId, courseData, indices, courseName, courseId, includeTimestamps, locale) {
-  let fullContent = `${'#'.repeat(60)}\n`;
-  fullContent += `# ${courseData.title}\n`;
-  fullContent += `# Total Chapters: ${courseData.chapters.length}\n`;
-  fullContent += `# Total Lectures: ${downloadState.progress.totalLectures}\n`;
-  fullContent += `${'#'.repeat(60)}\n\n`;
+async function downloadMerged(tabId, courseData, chapterPlans, courseName, courseId, includeTimestamps, locale) {
+  const mergedContentKey = '__merged__';
+  let fullContent = downloadState.chapterContents[mergedContentKey];
+
+  if (!fullContent) {
+    fullContent = `${'#'.repeat(60)}\n`;
+    fullContent += `# ${courseData.title}\n`;
+    fullContent += `# Total Chapters: ${chapterPlans.length}\n`;
+    fullContent += `# Total Lectures: ${downloadState.progress.totalLectures}\n`;
+    fullContent += `${'#'.repeat(60)}\n\n`;
+    downloadState.chapterContents[mergedContentKey] = fullContent;
+  }
 
   const startChapterPos = downloadState.progress.currentChapterIdx || 0;
 
-  for (let pos = startChapterPos; pos < indices.length; pos++) {
+  for (let pos = startChapterPos; pos < chapterPlans.length; pos++) {
     if (!downloadState.isRunning || downloadState.isPaused) {
       await saveState();
       return;
     }
 
-    const chapterIndex = indices[pos];
+    const { chapterIndex, lectureIndices } = chapterPlans[pos];
     const chapter = courseData.chapters[chapterIndex];
     const chapterNum = String(chapterIndex + 1).padStart(2, '0');
 
@@ -528,22 +857,22 @@ async function downloadMerged(tabId, courseData, indices, courseName, courseId, 
     fullContent += `Chapter ${chapterNum}: ${chapter.title}\n`;
     fullContent += `${'='.repeat(60)}\n\n`;
 
-    const startLecture = (pos === startChapterPos) ? (downloadState.progress.currentLectureIdx || 0) : 0;
+    const startLecturePos = pos === startChapterPos ? (downloadState.progress.currentLectureIdx || 0) : 0;
 
-    for (let i = startLecture; i < chapter.lectures.length; i++) {
+    for (let lecturePos = startLecturePos; lecturePos < lectureIndices.length; lecturePos++) {
       while (downloadState.isPaused) {
         await sleep(1000);
         if (!downloadState.isRunning) return;
       }
       if (!downloadState.isRunning) return;
 
-      const lecture = chapter.lectures[i];
+      const lectureIndex = lectureIndices[lecturePos];
+      const lecture = chapter.lectures[lectureIndex];
       downloadState.progress.currentChapterIdx = pos;
-      downloadState.progress.currentLectureIdx = i;
       downloadState.progress.currentLectureName = lecture.title;
       broadcastProgress();
 
-      const lectureNum = String(i + 1).padStart(2, '0');
+      const lectureNum = String(lectureIndex + 1).padStart(2, '0');
       fullContent += `${'-'.repeat(40)}\n`;
       fullContent += `Lecture ${lectureNum}: ${lecture.title}\n`;
       fullContent += `${'-'.repeat(40)}\n\n`;
@@ -564,7 +893,9 @@ async function downloadMerged(tabId, courseData, indices, courseName, courseId, 
       }
 
       fullContent += '\n\n';
+      downloadState.chapterContents[mergedContentKey] = fullContent;
       downloadState.progress.processedLectures++;
+      downloadState.progress.currentLectureIdx = lecturePos + 1;
       broadcastProgress();
 
       if (downloadState.progress.processedLectures % 5 === 0) {
@@ -574,12 +905,15 @@ async function downloadMerged(tabId, courseData, indices, courseName, courseId, 
       await sleep(CONFIG.BASE_DELAY);
     }
 
+    downloadState.progress.currentChapterIdx = pos + 1;
     downloadState.progress.currentLectureIdx = 0;
+    await saveState();
   }
 
   // 下載合併檔案
   const filename = `${courseName}_complete_transcript.txt`;
   downloadTextFile(fullContent, filename);
+  delete downloadState.chapterContents[mergedContentKey];
 }
 
 // ============================================================
@@ -630,7 +964,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       broadcastProgress();
     } else if (!downloadState.isRunning && downloadState.courseData) {
       // 從中斷恢復
-      startDownload(downloadState.tabId, downloadState.courseData, downloadState.options);
+      startDownload(downloadState.tabId, downloadState.courseData, downloadState.options, true);
     }
     sendResponse({ success: true });
     return true;

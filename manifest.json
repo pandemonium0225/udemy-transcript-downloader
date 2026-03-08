@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Udemy Transcript Downloader",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "批次下載 Udemy 課程逐字稿，按章節分檔輸出 TXT",
   "permissions": [
     "activeTab",
@@ -11,7 +11,10 @@
     "alarms"
   ],
   "host_permissions": [
-    "https://*.udemy.com/*"
+    "https://*.udemy.com/*",
+    "https://*.udemycdn.com/*",
+    "https://*.cloudfront.net/*",
+    "https://*.amazonaws.com/*"
   ],
   "action": {
     "default_popup": "popup.html",
